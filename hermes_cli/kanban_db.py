@@ -5323,15 +5323,19 @@ def complete_task(
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
-    """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+    """Transition any non-terminal status -> ``done`` and record ``result``.
 
-    Accepts a task that is merely ``ready`` too, so a manual CLI
-    completion (``hermes kanban complete <id>``) works without requiring
-    a claim/start/complete sequence. ``review`` is accepted so a human
-    (or reviewer) can approve a task parked in the review lane by
+    Accepts tasks parked in ``triage``, ``todo``, or ``scheduled`` as well
+    as ``ready``/``running``/``blocked``/``review``, so a human can complete
+    a ticket the moment the work is finished — including tasks the "New
+    task" dialog creates in triage/todo/scheduled and never claims. A
+    manual CLI completion (``hermes kanban complete <id>``) works without
+    requiring a claim/start/complete sequence. ``review`` is accepted so a
+    human (or reviewer) can approve a task parked in the review lane by
     :func:`request_review` — even when it has no active run
     (``current_run_id IS NULL``), the handoff fields are preserved via
-    :func:`_synthesize_ended_run`.
+    :func:`_synthesize_ended_run`. ``done``/``archived`` remain excluded
+    (terminal states are never re-completed).
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -5415,7 +5419,8 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('triage', 'todo', 'scheduled',
+                                  'ready', 'running', 'blocked', 'review')
                 """,
                 (result, now, task_id),
             )
@@ -5432,7 +5437,8 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('triage', 'todo', 'scheduled',
+                                  'ready', 'running', 'blocked', 'review')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),

@@ -273,6 +273,64 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
         )
 
 
+def test_patch_done_from_triage_returns_done(client):
+    """A ticket created by the "New task" dialog and parked in triage must be
+    completable via PATCH {\"status\":\"done\"} — previously the transition
+    matrix refused triage/todo/scheduled entirely."""
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "parked in triage"},
+    ).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "triage"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "triage"
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "done"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "done"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task["id"]).completed_at is not None
+
+
+def test_patch_done_from_triage_with_open_parent_409_names_parent(client):
+    """A triage task with an open parent must still be refused a done
+    transition — but the 409 detail must name the blocking parent so the
+    dashboard can render an actionable toast."""
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "parent still open"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "gated child", "parents": [parent["id"]]},
+    ).json()["task"]
+    assert child["status"] == "todo"
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}",
+        json={"status": "triage"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "triage"
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}",
+        json={"status": "done"},
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "Cannot move to 'done'" in detail
+    assert parent["title"] in detail
+    assert parent["id"] in detail
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child["id"]).status == "triage"
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 

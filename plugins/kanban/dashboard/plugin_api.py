@@ -949,10 +949,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
-                # For ``ready``, name the blocking parent(s) so the dashboard
-                # can render an actionable toast instead of a silent no-op.
-                # See #26744.
-                if s == "ready":
+                # For ``ready`` and ``done``, name the blocking parent(s) so
+                # the dashboard can render an actionable toast instead of a
+                # silent no-op. See #26744.
+                if s in ("ready", "done"):
                     blockers = _parents_blocking_ready(conn, task_id)
                     if blockers:
                         names = ", ".join(
@@ -962,7 +962,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                         raise HTTPException(
                             status_code=409,
                             detail=(
-                                f"Cannot move to 'ready': blocked by parent(s) "
+                                f"Cannot move to {s!r}: blocked by parent(s) "
                                 f"not done — {names}"
                             ),
                         )

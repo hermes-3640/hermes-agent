@@ -615,6 +615,73 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# Human completion from parked (non-terminal) states
+# ---------------------------------------------------------------------------
+
+
+def _park_task_in_triage(conn: sqlite3.Connection, task_id: str) -> None:
+    conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (task_id,))
+
+
+def _park_task_in_todo(conn: sqlite3.Connection, task_id: str) -> None:
+    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+
+
+def _park_task_in_scheduled(conn: sqlite3.Connection, task_id: str) -> None:
+    assert kb.schedule_task(conn, task_id, reason="parked") is True
+
+
+@pytest.mark.parametrize(
+    ("park", "initial"),
+    [
+        (_park_task_in_triage, "triage"),
+        (_park_task_in_todo, "todo"),
+        (_park_task_in_scheduled, "scheduled"),
+    ],
+    ids=["triage", "todo", "scheduled"],
+)
+def test_complete_task_from_parked_non_terminal_state(kanban_home, park, initial):
+    """A human must be able to complete a ticket parked in triage/todo/scheduled.
+
+    These are exactly the states the dashboard "New task" dialog creates and
+    where human users park tickets — they are never claimed, so previously
+    ``complete_task`` refused them with a transition error. Any non-terminal
+    task must now be completable by a human.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="human-completed ticket")
+        park(conn, tid)
+        assert kb.get_task(conn, tid).status == initial
+
+        ok = kb.complete_task(conn, tid, result="finished by hand")
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        assert task.completed_at is not None
+        assert any(
+            event.kind == "completed" for event in kb.list_events(conn, tid)
+        )
+
+
+def test_complete_task_from_triage_denied_with_open_parent(kanban_home):
+    """The parent dependency gate must survive the widening: a triage child
+    whose parent is not done/archived is still NOT completable."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="still open parent")
+        child = kb.create_task(
+            conn, title="gated child", triage=True, parents=[parent],
+        )
+        assert kb.get_task(conn, child).status == "triage"
+
+        assert kb.complete_task(conn, child, result="premature") is False
+        assert kb.get_task(conn, child).status == "triage"
+        assert kb.get_task(conn, child).completed_at is None
+        assert not any(
+            event.kind == "completed" for event in kb.list_events(conn, child)
+        )
+
+
+# ---------------------------------------------------------------------------
 # Deferred scratch cleanup for parent/child handoff (#33774)
 # ---------------------------------------------------------------------------
 
