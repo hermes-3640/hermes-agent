@@ -254,6 +254,148 @@ class TestAuth:
         assert result.status == 401
 
 
+class TestStopSession:
+    @pytest.mark.asyncio
+    async def test_requires_auth(self):
+        adapter = _make_adapter(api_key="sk-secret")
+        request = MagicMock()
+        request.headers = {}
+        response = await adapter._handle_stop_session(request)
+        assert response.status == 401
+
+    @pytest.mark.asyncio
+    async def test_503_when_no_gateway_runner(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter.gateway_runner = None
+        monkeypatch.setattr(adapter, "_ensure_session_db_async", AsyncMock(return_value=None))
+        request = MagicMock()
+        request.headers = {}
+        request.match_info = {"session_id": "session-123"}
+
+        response = await adapter._handle_stop_session(request)
+
+        assert response.status == 503
+
+    @pytest.mark.asyncio
+    async def test_409_when_session_not_running(self, monkeypatch):
+        adapter = _make_adapter()
+        interrupted = []
+
+        class FakeRunner:
+            def _peek_session_state(self, session_id):
+                assert session_id == "session-123"
+                return None
+
+        adapter.gateway_runner = FakeRunner()
+        monkeypatch.setattr(
+            adapter, "_ensure_session_db_async", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server.request_hard_interrupt",
+            lambda agent, reason: interrupted.append((agent, reason)),
+        )
+        request = MagicMock()
+        request.headers = {}
+        request.match_info = {"session_id": "session-123"}
+
+        response = await adapter._handle_stop_session(request)
+
+        assert response.status == 409
+        assert interrupted == []
+
+    @pytest.mark.asyncio
+    async def test_409_when_agent_is_pending_sentinel(self, monkeypatch):
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        adapter = _make_adapter()
+        state = types.SimpleNamespace(turn=types.SimpleNamespace(agent=_AGENT_PENDING_SENTINEL))
+        adapter.gateway_runner = types.SimpleNamespace(
+            _peek_session_state=lambda _session_id: state
+        )
+        monkeypatch.setattr(
+            adapter, "_ensure_session_db_async", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server.request_hard_interrupt",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("interrupt attempted")),
+        )
+        request = MagicMock()
+        request.headers = {}
+        request.match_info = {"session_id": "session-123"}
+
+        response = await adapter._handle_stop_session(request)
+
+        assert response.status == 409
+
+    @pytest.mark.asyncio
+    async def test_stops_running_session(self, monkeypatch):
+        adapter = _make_adapter()
+        agent = object()
+        state = types.SimpleNamespace(turn=types.SimpleNamespace(agent=agent))
+        looked_up = []
+        interrupted = []
+        reaped = []
+
+        class FakeDB:
+            def resolve_session_id(self, session_id):
+                assert session_id == "session-alias"
+                return "session-resolved"
+
+        class FakeRunner:
+            def _peek_session_state(self, session_id):
+                looked_up.append(session_id)
+                return state
+
+        adapter.gateway_runner = FakeRunner()
+        monkeypatch.setattr(
+            adapter, "_ensure_session_db_async", AsyncMock(return_value=FakeDB())
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server.request_hard_interrupt",
+            lambda current_agent, reason: interrupted.append((current_agent, reason)) or True,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._reap_disconnected_agent_processes",
+            lambda current_agent, source: reaped.append((current_agent, source)),
+        )
+        request = MagicMock()
+        request.headers = {}
+        request.match_info = {"session_id": "session-alias"}
+
+        response = await adapter._handle_stop_session(request)
+
+        assert response.status == 200
+        assert json.loads(response.text) == {
+            "session_id": "session-alias",
+            "status": "stopping",
+        }
+        assert looked_up == ["session-resolved"]
+        assert interrupted == [(agent, "Stopped via dashboard")]
+        assert reaped == [(agent, "api_server_session_stop")]
+
+    @pytest.mark.asyncio
+    async def test_resolve_session_id_error_is_tolerated(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter.gateway_runner = types.SimpleNamespace(
+            _peek_session_state=lambda session_id: None
+        )
+
+        class FailingDB:
+            def resolve_session_id(self, _session_id):
+                raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(
+            adapter, "_ensure_session_db_async", AsyncMock(return_value=FailingDB())
+        )
+        request = MagicMock()
+        request.headers = {}
+        request.match_info = {"session_id": "session-123"}
+
+        response = await adapter._handle_stop_session(request)
+
+        assert response.status == 409
+
+
 # ---------------------------------------------------------------------------
 # Concurrency cap (gateway.api_server.max_concurrent_runs) — #7483
 # ---------------------------------------------------------------------------
@@ -2865,4 +3007,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

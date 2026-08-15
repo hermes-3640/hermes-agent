@@ -11,6 +11,7 @@ Exposes an HTTP server with endpoints:
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
+- POST /api/sessions/{session_id}/stop — interrupt the session agent turn from any surface (cli/kanban/cron/telegram/webui)
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
@@ -2072,6 +2073,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("POST", "/api/sessions/{session_id}/stop", self._handle_stop_session),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -7189,6 +7191,49 @@ class APIServerAdapter(BasePlatformAdapter):
                     "accepted": True,
                 })
         return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
+
+    async def _handle_stop_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/stop — interrupt a running agent turn in a session regardless of which surface started it (cli/kanban/cron/telegram/webui). Unknown/already-finished turns answer 409 session_not_running."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        resolved = session_id
+        db = await self._ensure_session_db_async()
+        if db is not None:
+            try:
+                resolved = db.resolve_session_id(session_id) or session_id
+            except Exception:
+                pass
+
+        runner = self.gateway_runner
+        if runner is None:
+            return web.json_response(
+                _openai_error("Gateway runner unavailable", code="gateway_unavailable"),
+                status=503,
+            )
+
+        try:
+            state = runner._peek_session_state(resolved)
+            agent = state.turn.agent if state is not None else None
+        except Exception:
+            agent = None
+
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return web.json_response(
+                _openai_error("Session is not running", code="session_not_running"),
+                status=409,
+            )
+
+        try:
+            request_hard_interrupt(agent, "Stopped via dashboard")
+        except Exception:
+            pass
+        _reap_disconnected_agent_processes(agent, source="api_server_session_stop")
+        return web.json_response({"session_id": session_id, "status": "stopping"})
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
