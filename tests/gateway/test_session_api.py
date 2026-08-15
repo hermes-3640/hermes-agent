@@ -472,6 +472,32 @@ async def test_create_session_respects_browser_source_and_model_lock(adapter, se
 
 
 @pytest.mark.asyncio
+async def test_create_session_respects_webui_source(adapter, session_db):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/sessions",
+            json={
+                "id": "webui-session",
+                "source": "webui",
+                "title": "Web UI session",
+            },
+        )
+        assert resp.status == 201, await resp.text()
+        payload = await resp.json()
+
+    assert payload["session"]["source"] == "webui"
+    row = session_db.get_session("webui-session")
+    assert row["source"] == "webui"
+
+
+def test_normalize_session_source_accepts_webui():
+    assert APIServerAdapter._normalize_session_source("webui") == "webui"
+    assert APIServerAdapter._normalize_session_source("WEBUI") == "webui"
+    assert APIServerAdapter._normalize_session_source(None) == "api_server"
+
+
+@pytest.mark.asyncio
 async def test_session_model_lock_endpoint_then_chat_reuses_persisted_lock_and_provider_credentials(
     adapter,
     session_db,
