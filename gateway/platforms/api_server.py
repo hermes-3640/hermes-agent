@@ -7222,17 +7222,42 @@ class APIServerAdapter(BasePlatformAdapter):
 
         from gateway.run import _AGENT_PENDING_SENTINEL
 
-        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+        run_agents: Dict[int, Any] = {}
+        if agent is not None and agent is not _AGENT_PENDING_SENTINEL:
+            run_agents[id(agent)] = agent
+        else:
+            # The adapter's own session-chat surface (source=webui via
+            # _handle_session_chat_stream) runs an independent agent lifecycle
+            # through _run_agent(), registering the live agent in
+            # _active_run_agents keyed by run_id — it never populates the
+            # TurnRunner turn slot above, so a live turn can look dead here.
+            # Fall back to scanning the run registries this surface keeps
+            # for its own runs (mirroring the live set in
+            # _readiness_work_counts: "stopping" is not terminal, and a
+            # "queued" run with no agent yet is the pending gap, 409 there).
+            session_ids = (resolved, session_id)
+            for run_id, status in self._run_statuses.items():
+                if status.get("status") not in {"queued", "running", "waiting_for_approval", "stopping"}:
+                    continue
+                if status.get("session_id") not in session_ids:
+                    continue
+                run_agent = self._active_run_agents.get(run_id)
+                if run_agent is None:
+                    continue
+                run_agents[id(run_agent)] = run_agent
+
+        if not run_agents:
             return web.json_response(
                 _openai_error("Session is not running", code="session_not_running"),
                 status=409,
             )
 
-        try:
-            request_hard_interrupt(agent, "Stopped via dashboard")
-        except Exception:
-            pass
-        _reap_disconnected_agent_processes(agent, source="api_server_session_stop")
+        for run_agent in run_agents.values():
+            try:
+                request_hard_interrupt(run_agent, "Stopped via dashboard")
+            except Exception:
+                pass
+            _reap_disconnected_agent_processes(run_agent, source="api_server_session_stop")
         return web.json_response({"session_id": session_id, "status": "stopping"})
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
