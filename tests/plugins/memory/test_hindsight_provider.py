@@ -1400,6 +1400,50 @@ class TestAvailability:
         assert p.is_available()
 
 
+    def test_cloud_mode_unavailable_without_api_key(self, tmp_path, monkeypatch):
+        """Cloud mode must be unavailable when no API key is set, even if
+        api_url has a default. This prevents the provider from registering
+        with a dead connection and grinding the agent into silent errors."""
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home",
+            lambda: tmp_path / "nonexistent",
+        )
+        # No HINDSIGHT_API_KEY env var; no config file → _load_config defaults
+        # to cloud mode with apiKey=""
+        p = HindsightMemoryProvider()
+        assert not p.is_available()
+
+
+    def test_cloud_mode_unavailable_reason_messages_api_key_missing(self, tmp_path, monkeypatch):
+        """When cloud mode has no API key, unavailable_reason() must return the
+        specific 'Hindsight API key missing — memory features disabled' message
+        so agent_init can log it prominently."""
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home",
+            lambda: tmp_path / "nonexistent",
+        )
+        p = HindsightMemoryProvider()
+        assert not p.is_available()
+        reason = p.unavailable_reason()
+        assert "API key missing" in reason
+        assert "memory features disabled" in reason
+
+
+    def test_cloud_mode_available_with_config_api_key(self, tmp_path, monkeypatch):
+        """When the config file has an apiKey key, is_available() must return True
+        even if the env var is absent."""
+        config = {"mode": "cloud", "apiKey": "config-key"}
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+        )
+        p = HindsightMemoryProvider()
+        assert p.is_available()
+        assert p.unavailable_reason() == ""
+
+
     def test_local_mode_unavailable_when_runtime_import_fails(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "plugins.memory.hindsight.get_hermes_home",

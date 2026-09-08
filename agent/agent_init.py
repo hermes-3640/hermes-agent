@@ -61,6 +61,11 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     if name in _warned_unavailable_providers:
         return
     _warned_unavailable_providers.add(name)
+    # Hindsight's unavailable_reason() returns a specific message for the
+    # "missing API key" case — log it as a standalone line so it is
+    # immediately visible in the log.
+    if name == "hindsight" and "API key missing" in reason:
+        logger.warning("Hindsight API key missing — memory features disabled")
     logger.warning(
         "Memory provider %r is selected but reports unavailable — external memory "
         "is disabled for this session (built-in memory still works). Check the "

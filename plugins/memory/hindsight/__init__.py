@@ -355,8 +355,13 @@ class HindsightMemoryProvider(MemoryProvider):
             mode = cfg.get("mode", "cloud")
             if mode in _LOCAL_MODES:
                 return _check_local_runtime()[0]
-            return mode == "local_external" or bool(
-                _cloud_api_key(cfg) or cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
+            if mode == "cloud":
+                # Cloud mode requires an API key — api_url defaults exist but
+                # without a key every request will 401.  Treat this as unavailable
+                # so the agent can start without memory instead of logging in
+                # circles every turn.
+                return bool(_cloud_api_key(cfg))
+            return bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
         except Exception:
             return False
 
@@ -367,11 +372,21 @@ class HindsightMemoryProvider(MemoryProvider):
         ``is_available()`` returns False for local modes when the embedded runtime can't be imported, so
         ``initialize()`` — and the hint it would log — is never reached (#7718). Surface the install
         guidance here, where agent_init warns about an unavailable provider.
+
+        Also returns a message for cloud mode without an API key so the agent can
+        emit the exact "Hindsight API key missing — memory features disabled" note.
         """
         try:
-            if _load_config().get("mode", "cloud") not in _LOCAL_MODES:
-                return ""
+            cfg = _load_config()
         except Exception:
+            return ""
+        # Cloud mode without API key — explicit message for the agent init warning.
+        if cfg.get("mode", "cloud") == "cloud":
+            api_key = _cloud_api_key(cfg)
+            if not api_key:
+                return "Hindsight API key missing — memory features disabled"
+            return ""
+        if cfg.get("mode", "cloud") not in _LOCAL_MODES:
             return ""
         available, reason = _check_local_runtime()
         return "" if available else _local_runtime_hint(reason).strip()
