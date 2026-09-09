@@ -92,6 +92,8 @@ _CAPABILITY_ENDPOINTS = (
     ("session_messages", ("GET", "/api/sessions/{session_id}/messages")),
     ("session_fork", ("POST", "/api/sessions/{session_id}/fork")),
     ("session_chat", ("POST", "/api/sessions/{session_id}/chat")),
+    ("session_slash", ("POST", "/api/sessions/{session_id}/slash")),
+
     ("session_chat_stream", ("POST", "/api/sessions/{session_id}/chat/stream")),
     ("session_model_lock", ("POST", "/api/sessions/{session_id}/model")),
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
@@ -1517,6 +1519,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
+            ("POST", "/api/sessions/{session_id}/slash", self._handle_session_slash),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
@@ -3248,6 +3251,28 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             model_lock="accepted")
         return web.json_response(
             {"object": "hermes.session.model_lock", "session_id": session_id, "runtime": runtime})
+
+    @_require_auth
+    async def _handle_session_slash(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/slash — execute a slash command as a REST endpoint."""
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        command = (body or {}).get("command", "").strip()
+        if not command:
+            return web.json_response({"error": "Missing or empty command"}, status=400)
+        try:
+            from hermes_cli.slash_exec import CommandContext, execute_command
+            result = execute_command(command, CommandContext(surface="gateway"))
+            output = result.text if result else ""
+            return web.json_response({"object": "hermes.session.slash", "session_id": session_id, "output": output})
+        except Exception as exc:
+            logger.exception("[api_server] slash command failed: %s", exc)
+            return web.json_response({"error": str(exc)}, status=500)
 
     # -- Cron jobs API ----------------------------------------------------------------
 
