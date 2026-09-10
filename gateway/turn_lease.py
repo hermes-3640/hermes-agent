@@ -194,8 +194,16 @@ class SessionTurnLeaseRegistry:
         naturally or picked up by a new acquire).
         """
         for sid, lease in list(self._leases.items()):
-            if lease.is_stale and lease.holder is not None:
-                self._force_release_stale(sid, lease)
+            if lease.holder is not None and lease.detected_stale is False:
+                age = lease.idle_age
+                threshold = lease.idle_timeout + STALE_GRACE_SECS
+                if age > threshold:
+                    logger.info(
+                        "Lease on session %s idle for %.0fs (threshold=%.0fs); "
+                        "will force-release", sid, age, threshold)
+                    # Only force-release when the holder exists and hasn't already
+                    # been marked stale.
+                    self._force_release_stale(sid, lease)
 
     def _force_release_stale(self, session_id: str, lease: _SessionLease) -> None:
         """Force-release a stale lease. The holder is marked as released (idempotent on the token),

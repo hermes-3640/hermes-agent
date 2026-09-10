@@ -621,22 +621,26 @@ class SessionCompressionMixin:
         """Diagnostic: return stale lease info WITHOUT releasing them.
         Same schema as sweep_stale_turn_leases return value."""
         threshold = time.time() - (max_age_seconds + max(0.0, grace_seconds))
-        rows = self._read(
-            "SELECT conversation_id, holder, acquired_at, expires_at "
-            "FROM session_turn_leases "
-            "WHERE expires_at <= ? AND acquired_at <= ?",
-            (time.time(), threshold)
-        )
+        now = time.time()
         result = []
-        for row in rows:
-            cid, holder, acquired_at, expires_at = row
-            result.append({
-                "conversation_id": cid,
-                "holder": holder,
-                "acquired_at": acquired_at,
-                "expires_at": expires_at,
-                "age_seconds": time.time() - acquired_at,
-            })
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT conversation_id, holder, acquired_at, expires_at "
+                "FROM session_turn_leases "
+                "WHERE expires_at <= ? AND acquired_at <= ?",
+                (now, threshold)
+            ).fetchall()
+            for row in rows:
+                cid, holder, acquired_at, expires_at = row
+                result.append({
+                    "conversation_id": cid,
+                    "holder": holder,
+                    "acquired_at": acquired_at,
+                    "expires_at": expires_at,
+                    "age_seconds": now - acquired_at,
+                })
+            return len(result)
+        self._execute_write(_do)
         return result
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
