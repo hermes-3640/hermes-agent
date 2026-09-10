@@ -107,6 +107,10 @@ DEFAULT_CONFIG = {
         # whole call; the OpenAI SDK also retries transient errors (max_retries=2). Set 1 for fast
         # failover to fallback providers; raise to tolerate longer provider hiccups.
         "api_max_retries": 3,
+        # Per-tool consecutive failure cap: when a tool errors this many times
+        # in a row (across turns), the loop breaks to prevent retry-loops.
+        # Default 5; 0 disables the guard.
+        "max_consecutive_tool_errors": 5,
         # Empty-response retry guard. Empty retries re-send the full input at full price; this stops
         # re-billing deterministic empties (unsignaled refusals, zero output tokens) while failing
         # open on ambiguous evidence (missing usage, any tokens, model/provider change).

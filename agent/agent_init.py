@@ -1363,6 +1363,19 @@ def _apply_agent_section(agent, _agent_cfg):
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # Per-tool consecutive failure cap: when a tool errors this many times
+    # in a row (across turns), the loop breaks to prevent retry-loops.
+    # Default 5; 0 disables the guard.
+    try:
+        _consec = int(_agent_section.get("max_consecutive_tool_errors", 5))
+        _consec = max(0, _consec)  # clamp to [0, inf)
+    except (TypeError, ValueError):
+        _consec = 5
+    agent._max_consecutive_tool_errors = _consec
+    # Per-tool consecutive failure tracker, keyed by tool name.
+    # Reset at session start; updated each tool round.
+    agent._consecutive_tool_errors: Dict[str, int] = {}
+
 
 def _positive_int(raw: Any, *, reject: tuple = ()) -> Optional[int]:
     """``int(raw)`` when positive, else None. ``reject`` lists types refused outright (bool, float)."""

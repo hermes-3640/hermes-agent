@@ -13,6 +13,7 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
+from agent.display import _detect_tool_failure
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
@@ -150,6 +151,45 @@ def run_tool_round(
             agent.stream_delta_callback(None)
 
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+    # ── Retry-loop detection ────────────────────────────────────────────
+    # Scan the tool results just appended for errors and update the
+    # per-tool consecutive failure counter.  When a tool errors this
+    # many times in a row (across turns), the loop breaks.
+    _max_consec = getattr(agent, "_max_consecutive_tool_errors", 0)
+    if _max_consec > 0:
+        _tool_names = {tc.function.name for tc in assistant_message.tool_calls}
+        _scanned_names = 0
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "tool" and msg.get("name") in _tool_names:
+                _fname = msg["name"]
+                _content = msg.get("content", "")
+                _is_err, _suffix = _detect_tool_failure(_fname, _content)
+                _errs = agent._consecutive_tool_errors.get(_fname, 0)
+                if _is_err:
+                    _errs += 1
+                else:
+                    _errs = 0  # reset on first success
+                agent._consecutive_tool_errors[_fname] = _errs
+                if _errs >= _max_consec:
+                    agent._emit_status(
+                        f"🛑 Tool '{_fname}' failed {_errs} times in a row — "
+                        f"breaking loop (max_consecutive_tool_errors={_max_consec})"
+                    )
+                    logger.warning(
+                        "Retry loop detected: tool '%s' failed %d consecutive times",
+                        _fname, _errs,
+                    )
+                    _turn_exit_reason = "retry_loop_detected"
+                    final_response = (
+                        f"Tool '{_fname}' failed {_errs} consecutive times. "
+                        f"Stopping to prevent infinite retry loop."
+                    )
+                    failed = True
+                    return _verdict("break")
+                _scanned_names += 1
+                if _scanned_names >= len(_tool_names):
+                    break  # covered all executed tool results
 
     if getattr(agent, "_incremental_persistence_failed", False):
         # Tool result could not be made canonical: never send the in-memory result to
