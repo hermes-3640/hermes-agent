@@ -64,6 +64,8 @@ _THRESHOLD_SOURCES: dict[str, tuple[str, str]] = {
     "exact_failure_block_after": ("hard_stop_after", "exact_failure"),
     "same_tool_failure_halt_after": ("hard_stop_after", "same_tool_failure"),
     "no_progress_block_after": ("hard_stop_after", "idempotent_no_progress"),
+    "path_failure_warn_after": ("warn_after", "path_failure"),
+    "path_failure_block_after": ("hard_stop_after", "path_failure"),
 }
 
 # Per-turn caps on runaway-prone tools (counters reset in reset_for_turn).
@@ -73,6 +75,25 @@ _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
 # Interactive surfaces plus bounded supervised task loops (subagent stopped by its parent;
 # api_server has a live client) doing real edit -> re-run work keep the warn-only default.
 _ATTENDED_PLATFORMS = frozenset({"cli", "tui", "desktop", "acp", "subagent", "api_server"})
+
+# File-path–carrying tools: the keys in their args dict that may hold a path.
+_PATH_CARRYING_TOOLS = frozenset({
+    "read_file", "write_file", "patch", "search_files",
+    "browser_exec", "browser_navigate", "browser_type", "browser_click", "browser_press", "browser_scroll",
+    "mcp_filesystem_read_file", "mcp_filesystem_read_text_file", "mcp_filesystem_read_multiple_files",
+    "mcp_filesystem_list_directory", "mcp_filesystem_list_directory_with_sizes",
+    "mcp_filesystem_directory_tree", "mcp_filesystem_get_file_info", "mcp_filesystem_search_files",
+})
+# Which arg key holds the path for each tool (None = "path").
+_PATH_ARG_OVERRIDE: dict[str, str] = {
+    "browser_navigate": "url",
+    "browser_exec": "code",
+    "browser_type": "selector",
+    "browser_click": "selector",
+    "browser_press": "key",
+    "browser_scroll": "selector",
+    "mcp_filesystem_read_multiple_files": "paths",  # list
+}
 
 
 def is_stall_guard_repeatable(tool_name: str) -> bool:
@@ -85,6 +106,54 @@ def _is_non_interactive_platform(platform: str | None) -> bool:
     if not isinstance(platform, str) or not platform.strip():
         return False
     return platform.strip().lower() not in _ATTENDED_PLATFORMS
+
+
+def _extract_file_path_from_args(tool_name: str, args: Mapping[str, Any] | None) -> str | None:
+    """Extract a file path from tool arguments for path-level failure tracking.
+
+    Returns the path string if found, else None. Returns the raw value as a fallback
+    when the resolved path would be needed (e.g. for tools that resolve relative paths).
+    """
+    if not isinstance(args, Mapping) or not args:
+        return None
+    if tool_name not in _PATH_CARRYING_TOOLS:
+        return None
+
+    override_key = _PATH_ARG_OVERRIDE.get(tool_name)
+    if override_key:
+        raw = args.get(override_key)
+    else:
+        raw = args.get("path")
+
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    if tool_name == "mcp_filesystem_read_multiple_files" and isinstance(raw, list):
+        # Use the first element; if multiple paths share the same root, the first is representative.
+        first = raw[0] if raw else None
+        if isinstance(first, str) and first.strip():
+            return first.strip()
+    return None
+
+
+def _path_from_terminal_cmd(cmd: str) -> str | None:
+    """Best-effort path extraction from a terminal command string.
+
+    Returns the first plausible path-like substring, or None.
+    """
+    if not cmd or not isinstance(cmd, str):
+        return None
+    # Look for paths starting with / or ./ or ../
+    for sep in (" ", "&&", ";", "|"):
+        parts = cmd.split(sep, 1)
+        for part in parts:
+            stripped = part.strip()
+            if stripped.startswith(("/", "./", "../")):
+                # Grab just the path segment (stop at next space or shell operator)
+                import re
+                m = re.match(r"(/[^\s;&|]+|(\./|\.\./)[^\s;&|]+)", stripped)
+                if m:
+                    return m.group(1)
+    return None
 
 
 @dataclass(frozen=True)
@@ -117,6 +186,11 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    # Path-aware tracking: per-(tool, path) consecutive failures.
+    path_failure_warn_after: int = 2
+    path_failure_block_after: int = 3
+    # Global consecutive-failure counter across all tools in a turn.
+    global_failure_halt_after: int = 5
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: LoopCapConfig = field(default_factory=LoopCapConfig)
@@ -257,6 +331,21 @@ _DECISION_MESSAGES: dict[str, str] = {
         "Blocked delegate_task: this turn has already spawned {count} subagents (limit {cap}). "
         "This looks like a runaway delegation loop. Finish the work with the results you have and answer the user."
     ),
+    # --- Path-aware tracking ---
+    "path_failure_block": (
+        "Repeated failures on {tool_name} at path {path}: failed {count} times consecutively. "
+        "This path appears to be missing, inaccessible, or misconfigured. "
+        "Stop retrying this path — diagnose the issue, check if the path is correct, or use a different approach."
+    ),
+    "path_failure_warning": (
+        "{tool_name} has failed {count} times on path {path}. This looks like a dead-end path; "
+        "inspect the error and try a different path or verify the file exists before retrying."
+    ),
+    "global_consecutive_failure_halt": (
+        "Tool-call failures have been consecutive for {count} attempts across different tools. "
+        "This pattern indicates a systematic issue (missing resources, misconfiguration, or an unreachable service). "
+        "Stop retrying the same failing actions. Diagnose the root cause or pivot to a different approach."
+    ),
 }
 
 _IDENTICAL_CALL_NOTICE = (
@@ -265,6 +354,7 @@ _IDENTICAL_CALL_NOTICE = (
     "Do not repeat it — change arguments, use a different tool, or "
     "proceed with what you have.]"
 )
+
 
 # tool -> (LoopCapConfig field, controller counter attribute, decision code)
 _LOOP_CAPS: dict[str, tuple[str, str, str]] = {
@@ -302,6 +392,11 @@ class ToolCallGuardrailController:
         self._persisted_result_paths: dict[str, str] = {}
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        # --- Path-aware consecutive-failure tracking ---
+        # (tool_name, file_path) -> consecutive failure count
+        self._path_failure_counts: dict[tuple[str, str], int] = {}
+        # Global consecutive-failure counter across all tools in the turn.
+        self._global_consecutive_failures: int = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -319,6 +414,19 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
         return decision
 
+    def _path_key(self, tool_name: str, args: Mapping[str, Any] | None) -> tuple[str, str] | None:
+        """Return (tool_name, path) if the tool carries a path argument, else None."""
+        path = _extract_file_path_from_args(tool_name, args)
+        if path is None:
+            # For terminal/execute_code, extract from command if it targets a file
+            if tool_name in ("terminal", "execute_code"):
+                raw_cmd = (args or {}).get("command", "") if isinstance(args, Mapping) else ""
+                path = _path_from_terminal_cmd(raw_cmd)
+                if path is not None:
+                    return (tool_name, path)
+            return None
+        return (tool_name, path)
+
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
@@ -335,6 +443,27 @@ class ToolCallGuardrailController:
         record = self._no_progress.get(signature) if self._is_idempotent(tool_name) else None
         if record is not None and record[1] >= self.config.no_progress_block_after:
             return self._decide("block", "idempotent_no_progress_block", tool_name, record[1], signature)
+        # --- Path-level pre-call check ---
+        path_key = self._path_key(tool_name, args)
+        if path_key is not None:
+            path_count = self._path_failure_counts.get(path_key, 0)
+            if path_count >= self.config.path_failure_block_after:
+                tool_name_for_msg, path_val = path_key
+                return self._decide(
+                    "block", "path_failure_block", tool_name, path_count, signature,
+                    path=path_val,
+                    message=_DECISION_MESSAGES["path_failure_block"].format(
+                        tool_name=tool_name, count=path_count, path=path_val,
+                    ),
+                )
+        # --- Global consecutive-failure pre-call check ---
+        if self._global_consecutive_failures >= self.config.global_failure_halt_after:
+            return self._decide(
+                "halt", "global_consecutive_failure_halt", tool_name, self._global_consecutive_failures, signature,
+                message=_DECISION_MESSAGES["global_consecutive_failure_halt"].format(
+                    count=self._global_consecutive_failures,
+                ),
+            )
         return allow
 
     def after_call(
@@ -376,8 +505,33 @@ class ToolCallGuardrailController:
                     "warn", "same_tool_failure_warning", tool_name, same_count, signature,
                     message=_tool_failure_recovery_hint(tool_name, same_count),
                 )
+            # --- Path-aware failure tracking ---
+            path_key = self._path_key(tool_name, args)
+            if path_key is not None:
+                path_count = self._path_failure_counts.get(path_key, 0) + 1
+                self._path_failure_counts[path_key] = path_count
+                if warnings and path_count >= self.config.path_failure_warn_after:
+                    tool_name_for_msg, path_val = path_key
+                    return self._decide(
+                        "warn", "path_failure_warning", tool_name, path_count, signature,
+                        path=path_val,
+                        message=_DECISION_MESSAGES["path_failure_warning"].format(
+                            tool_name=tool_name, count=path_count, path=path_val,
+                        ),
+                    )
+            # --- Global consecutive-failure tracking ---
+            self._global_consecutive_failures += 1
+            if self._global_consecutive_failures >= self.config.global_failure_halt_after:
+                return self._decide(
+                    "halt", "global_consecutive_failure_halt", tool_name,
+                    self._global_consecutive_failures, signature,
+                    message=_DECISION_MESSAGES["global_consecutive_failure_halt"].format(
+                        count=self._global_consecutive_failures,
+                    ),
+                )
             return ToolGuardrailDecision(tool_name=tool_name, count=exact_count, signature=signature)
 
+        # Success resets per-path and global counters (progress made).
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
         # A successful mutation is progress for every failing signature still counted
@@ -385,6 +539,9 @@ class ToolCallGuardrailController:
         if tool_name in PROGRESS_RESET_TOOL_NAMES or file_mutation_result_landed(tool_name, result):
             self._progress_since_failure.update(dict.fromkeys(self._exact_failure_counts, True))
             self._same_tool_failure_counts.clear()
+        # Reset path failures on success for the same tool+path (progress made).
+        self._path_failure_counts = {k: v for k, v in self._path_failure_counts.items() if k[0] != tool_name or not file_mutation_result_landed(tool_name, result)}
+        self._global_consecutive_failures = 0
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)

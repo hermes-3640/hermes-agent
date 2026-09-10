@@ -15,11 +15,13 @@ session indefinitely. See t_a1055472.
 
 import asyncio
 import logging
+import os
 import time
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+# ── Defaults ────────────────────────────────────────────────────────────────
 # Cap on tracked leases. Idle entries evict oldest-first; live leases never do, so a burst of
 # distinct sessions may transiently exceed the cap rather than break serialization.
 DEFAULT_MAX_LEASES = 512
@@ -27,6 +29,15 @@ DEFAULT_MAX_LEASES = 512
 # HERMES_TURN_LEASE_TIMEOUT — lease contention is not agent inactivity). Fail-closed but short:
 # never pin a sequential platform updater for minutes.
 DEFAULT_LEASE_WAIT = 5.0
+# Maximum concurrent coroutines awaiting a single session's lease. Prevents a thundering herd of
+# orphaned waiter threads from piling up on a deadlock.
+DEFAULT_MAX_WAITERS = 8
+# Idle TTL (seconds): if a lease holder has not used the lease (no acquire/release/use) for this
+# duration, the periodic cleanup task force-releases it. This is a *safety net*, not a turn budget;
+# normal turns release immediately after flush, so this value only fires on genuinely stuck turns.
+DEFAULT_LEASE_IDLE_TIMEOUT = 300.0  # 5 minutes
+# Periodic cleanup interval (seconds): how often the background task scans for stale/leased leases.
+DEFAULT_LEASE_CLEANUP_INTERVAL = 60.0  # 1 minute
 
 # ── Deadlock-detection thresholds ──────────────────────────────────────
 
