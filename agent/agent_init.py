@@ -2311,6 +2311,21 @@ def init_agent(
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
+    _init_retry_loop_tracker(agent)
+
+
+def _init_retry_loop_tracker(agent) -> None:
+    """Attach a retry-loop tracker so ``tool_executor`` can detect and interrupt
+    repeated-failure loops before the agent burns its entire turn budget.
+
+    The tracker is lazily initialised so an absent ``tool_executor`` module
+    (e.g. a stripped test harness) does not break agent construction.
+    """
+    try:
+        from agent.tool_executor import _RetryLoopTracker
+        agent._retry_loop_tracker = _RetryLoopTracker()
+    except ImportError:
+        pass  # tool_executor not available — detection silently skipped
 
 
 __all__ = ["init_agent"]

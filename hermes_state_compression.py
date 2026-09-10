@@ -555,6 +555,90 @@ class SessionCompressionMixin:
                 (conversation_id, holder))
         self._execute_write(_do)
 
+    def sweep_stale_turn_leases(self, max_age_seconds: float = 300.0,
+                                 grace_seconds: float = 60.0) -> list:
+        """Sweep and force-release expired turn leases in the DB.
+
+        Called at startup or on demand (e.g. when another subsystem detects a
+        dead process). Returns a list of dicts with keys:
+        ``conversation_id``, ``holder``, ``acquired_at``, ``expires_at``,
+        ``age_seconds`` — one entry per lease released.
+
+        A lease is considered stale when ``expires_at`` is in the past AND the
+        lease has been idle longer than ``max_age_seconds + grace_seconds``.
+        This dual check prevents false positives from a process that just started
+        a long tool call (the refresh loop hasn't fired yet).
+        """
+        if max_age_seconds <= 0:
+            max_age_seconds = 300.0  # default 5 min
+        grace = max(0.0, grace_seconds)
+        now = time.time()
+        threshold = now - (max_age_seconds + grace)
+
+        released_info = []
+
+        def _do(conn):
+            # Find all expired leases whose age exceeds the threshold.
+            rows = conn.execute(
+                "SELECT conversation_id, holder, acquired_at, expires_at "
+                "FROM session_turn_leases "
+                "WHERE expires_at <= ? AND acquired_at <= ?",
+                (now, threshold)
+            ).fetchall()
+            if not rows:
+                return 0
+
+            for row in rows:
+                cid, holder, acquired_at, expires_at = row
+                age = now - acquired_at
+                logger.warning(
+                    "Swept stale turn lease on session %s (DB): holder=%s, "
+                    "acquired_at=%.1f (age=%.0fs), expires_at=%.1f — force-released. "
+                    "This lease was stale on disk and has been cleaned up to prevent "
+                    "deadlock on the next turn.",
+                    cid, holder, acquired_at, age, expires_at)
+                released_info.append({
+                    "conversation_id": cid,
+                    "holder": holder,
+                    "acquired_at": acquired_at,
+                    "expires_at": expires_at,
+                    "age_seconds": age,
+                })
+
+            # Delete all stale leases in one statement.
+            placeholders = ",".join("?" * len(released_info))
+            conn.execute(
+                f"DELETE FROM session_turn_leases WHERE conversation_id IN ({placeholders})",
+                [r["conversation_id"] for r in released_info]
+            )
+            return len(released_info)
+
+        self._execute_write(_do)
+        return released_info
+
+    def get_stale_turn_lease_info(self, max_age_seconds: float = 300.0,
+                                   grace_seconds: float = 60.0) -> list:
+        """Diagnostic: return stale lease info WITHOUT releasing them.
+        Same schema as sweep_stale_turn_leases return value."""
+        threshold = time.time() - (max_age_seconds + max(0.0, grace_seconds))
+        rows = self._read(
+            "SELECT conversation_id, holder, acquired_at, expires_at "
+            "FROM session_turn_leases "
+            "WHERE expires_at <= ? AND acquired_at <= ?",
+            (time.time(), threshold)
+        )
+        result = []
+        for row in rows:
+            cid, holder, acquired_at, expires_at = row
+            result.append({
+                "conversation_id": cid,
+                "holder": holder,
+                "acquired_at": acquired_at,
+                "expires_at": expires_at,
+                "age_seconds": time.time() - acquired_at,
+            })
+        return result
+
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Current (non-expired) holder for ``session_id``, or None. Diagnostic only."""
         if not session_id:

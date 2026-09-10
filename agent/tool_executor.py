@@ -17,7 +17,7 @@ import os
 import random
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from agent.display import (
@@ -55,6 +55,218 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+# ── Retry-loop detection constants ──────────────────────────────────────────
+# Per-tool consecutive-failure threshold: when a tool+args fails this many
+# times in a row, inject a steer warning that forces the agent to reconsider.
+_RETRY_LOOP_PER_TOOL_THRESHOLD = 3
+# Global consecutive-failure threshold across *different* tools; when the agent
+# burns through this many tool calls in a row with failures, inject a broad
+# steer message recommending a pivot in strategy.
+_RETRY_LOOP_GLOBAL_THRESHOLD = 5
+
+# Tool-argument keys that identify the "target" of an operation (file, URL, etc.)
+_FILE_TOOLS_KEYS = frozenset({"path", "target_file", "file_path", "filename"})
+_TERMINAL_KEY = "command"
+_SEARCH_KEY = "query"
+_URL_KEY = "url"
+_URLS_KEY = "urls"
+_CODE_KEY = "code"
+
+
+@dataclass
+class _RetryLoopTracker:
+    """Tracks consecutive tool-call failures for retry-loop detection.
+
+    ``per_tool_fails`` maps ``(args_fingerprint, tool_name)`` → consecutive
+    failure count.  ``global_consecutive_failures`` counts streaks across
+    different tools.  ``last_failing_tool`` remembers which tool started the
+    current global streak so the steer message can name it.
+    """
+
+    per_tool_fails: dict[tuple[str, str], int] = field(default_factory=dict)
+    global_consecutive_failures: int = 0
+    last_failing_tool: str | None = None
+
+    def increment_global(self) -> None:
+        self.global_consecutive_failures += 1
+
+    def reset_all(self) -> None:
+        self.per_tool_fails.clear()
+        self.global_consecutive_failures = 0
+        self.last_failing_tool = None
+
+    def update_per_tool(
+        self, args_fp: str, tool_name: str, *, is_success: bool
+    ) -> None:
+        if is_success:
+            self.per_tool_fails.pop((args_fp, tool_name), None)
+        else:
+            self.per_tool_fails[(args_fp, tool_name)] = (
+                self.per_tool_fails.get((args_fp, tool_name), 0) + 1
+            )
+
+
+def _args_fingerprint(tool_name: str, function_args: dict) -> str:
+    """Return a stable fingerprint of *which* resource this tool operates on.
+
+    This lets us detect "the agent keeps trying to edit the same missing file"
+    rather than just "the agent keeps calling write_file".
+    """
+    # File-targeting tools: extract the file path.
+    for key in _FILE_TOOLS_KEYS:
+        if key in function_args:
+            val = function_args[key]
+            if isinstance(val, str):
+                return val
+    # Terminal: the command itself.
+    if tool_name == "terminal" and _TERMINAL_KEY in function_args:
+        cmd = function_args[_TERMINAL_KEY]
+        if isinstance(cmd, str):
+            return cmd[:200]  # truncate long commands
+    # Web search: the query.
+    if tool_name == "web_search" and _SEARCH_KEY in function_args:
+        q = function_args[_SEARCH_KEY]
+        if isinstance(q, str):
+            return q
+    # Web extract: the first URL.
+    if tool_name == "web_extract" and _URLS_KEY in function_args:
+        urls = function_args[_URLS_KEY]
+        if isinstance(urls, list) and urls:
+            return urls[0]
+    if tool_name == "web_extract" and _URL_KEY in function_args:
+        u = function_args[_URL_KEY]
+        if isinstance(u, str):
+            return u
+    # Execute code: the code snippet.
+    if tool_name == "execute_code" and _CODE_KEY in function_args:
+        code = function_args[_CODE_KEY]
+        if isinstance(code, str):
+            return code[:200]  # truncate long scripts
+    # delegate_task: the first task's goal.
+    if tool_name == "delegate_task":
+        tasks = function_args.get("tasks")
+        if isinstance(tasks, list) and tasks:
+            goal = tasks[0].get("goal", "") if isinstance(tasks[0], dict) else ""
+            if isinstance(goal, str):
+                return goal[:200]
+    # Fallback: use the first string value in args, or empty.
+    for v in function_args.values():
+        if isinstance(v, str):
+            return v
+    return ""
+
+
+def _retry_loop_steer_per_tool(
+    tool_name: str, args_fp: str, count: int
+) -> str:
+    """Return a steer message for repeated per-tool failures."""
+    return (
+        f"[SYSTEM: Repeated failures detected. Tool '{tool_name}' failed "
+        f"{count} consecutive times with the same arguments (key='{args_fp}'). "
+        f"The operation is unlikely to succeed on retry — reconsider your "
+        f"approach or verify prerequisites before continuing.]"
+    )
+
+
+def _retry_loop_steer_global(
+    tool_name: str | None, global_count: int
+) -> str:
+    """Return a steer message for repeated global failures."""
+    tool_info = f" (started with '{tool_name}')" if tool_name else ""
+    return (
+        f"[SYSTEM: The agent has encountered {global_count} consecutive tool "
+        f"failures across multiple operations{tool_info}. Multiple independent "
+        f"operations are failing — this is unlikely to be transient. Re-evaluate "
+        f"your overall strategy, check prerequisites, and consider whether the "
+        f"current plan is feasible before continuing.]"
+    )
+
+
+def _inject_retry_loop_steer(agent: Any, steer_text: str) -> None:
+    """Append steer text to the agent's pending steer queue.
+
+    The steer text is consumed by the existing ``/steer`` infrastructure
+    (``_drain_pending_steer`` → injected into tool results) so the agent
+    sees it before the next API call.
+    """
+    try:
+        lock = getattr(agent, "_pending_steer_lock", None)
+        if lock is not None:
+            with lock:
+                existing = getattr(agent, "_pending_steer", None) or ""
+                agent._pending_steer = existing + "\n" + steer_text
+        else:
+            existing = getattr(agent, "_pending_steer", None) or ""
+            agent._pending_steer = existing + "\n" + steer_text
+    except Exception:
+        # Never crash the tool pipeline; log and ignore.
+        logger.debug(
+            "Failed to inject retry-loop steer (non-fatal)",
+            exc_info=True,
+        )
+
+
+def _detect_consecutive_tool_failure(
+    agent: Any, tool_name: str, function_args: dict
+) -> str | None:
+    """Check whether per-tool consecutive failures have crossed the threshold.
+
+    Returns the steer message to inject (or ``None`` if not yet triggered).
+    """
+    tracker = getattr(agent, "_retry_loop_tracker", None)
+    if tracker is None:
+        return None
+    args_fp = _args_fingerprint(tool_name, function_args)
+    count = tracker.per_tool_fails.get((args_fp, tool_name), 0)
+    if count >= _RETRY_LOOP_PER_TOOL_THRESHOLD:
+        return _retry_loop_steer_per_tool(tool_name, args_fp, count)
+    return None
+
+
+def _check_global_consecutive_failures(
+    agent: Any,
+) -> str | None:
+    """Check whether global consecutive failures have crossed the threshold.
+
+    Returns the steer message to inject (or ``None`` if not yet triggered).
+    """
+    tracker = getattr(agent, "_retry_loop_tracker", None)
+    if tracker is None:
+        return None
+    if tracker.global_consecutive_failures >= _RETRY_LOOP_GLOBAL_THRESHOLD:
+        return _retry_loop_steer_global(
+            tracker.last_failing_tool, tracker.global_consecutive_failures
+        )
+    return None
+
+
+def _track_consecutive_tool_failure(
+    agent: Any, tool_name: str, function_args: dict
+) -> None:
+    """Record one consecutive failure for the given tool+args.
+
+    Updates both the per-tool counter and the global counter.
+    """
+    tracker = getattr(agent, "_retry_loop_tracker", None)
+    if tracker is None:
+        return
+    args_fp = _args_fingerprint(tool_name, function_args)
+    tracker.update_per_tool(args_fp, tool_name, is_success=False)
+    tracker.increment_global()
+    tracker.last_failing_tool = tool_name
+
+
+def _reset_consecutive_tool_failure(
+    agent: Any, tool_name: str, function_args: dict
+) -> None:
+    """Record one success for the given tool+args — resets counters."""
+    tracker = getattr(agent, "_retry_loop_tracker", None)
+    if tracker is None:
+        return
+    args_fp = _args_fingerprint(tool_name, function_args)
+    tracker.update_per_tool(args_fp, tool_name, is_success=True)
+    tracker.reset_all()
 
 
 _pairing_tool_call_id = coalesce_tool_call_id  # canonical id used by the persisted assistant message
@@ -1035,15 +1247,42 @@ def _commit_tool_result(
             agent.tool_progress_callback, "Tool progress",
             "tool.completed", function_name, None, None, duration=tool_duration, is_error=is_error, result=function_result,
         )
+
+    # ── Retry-loop detection ────────────────────────────────────────────
+    # Record the outcome and check for repeated failures.  This runs for
+    # every committed result so even parallel batches get per-call detection.
+    # Blocked / interrupted / timed-out calls are NOT counted as failures
+    # (they are transient or user-driven and legitimate to retry).
+    _execution_timed_out = isinstance(function_result, (_ToolTimeoutResult, _ToolCancelledResult))
+    if not blocked and not _execution_timed_out:
+        if is_error:
+            _track_consecutive_tool_failure(agent, function_name, function_args)
+            # Check per-tool threshold and inject steer if triggered.
+            steer_msg = _detect_consecutive_tool_failure(agent, function_name, function_args)
+            if steer_msg:
+                _inject_retry_loop_steer(agent, steer_msg)
+        else:
+            # Success resets both per-tool and global counters.
+            _reset_consecutive_tool_failure(agent, function_name, function_args)
+
     return persisted_result, function_result, tool_message.get("_tool_output_risk")
 
 
 def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tools: int, budget: BudgetConfig) -> None:
     """Per-turn aggregate budget enforcement, then /steer injection — in that order, so the
-    steer marker is never truncated/discarded when enforcement replaces a result."""
+    steer marker is never truncated/discarded when enforcement replaces a result.
+
+    Also checks the global consecutive-failure counter and injects a broad
+    steer message when the agent has burned through multiple different tools
+    without any success.
+    """
     if num_tools <= 0:
         return
     enforce_turn_budget(messages[-num_tools:], env=get_active_env(effective_task_id), config=budget)
+    # Global retry-loop check (crosses per-tool check which runs per-call).
+    global_steer = _check_global_consecutive_failures(agent)
+    if global_steer:
+        _inject_retry_loop_steer(agent, global_steer)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 
