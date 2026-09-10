@@ -2114,7 +2114,7 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.extend(["chat", "-q", f"work kanban task {task.id}: {task.title}"])
     if task.goal_mode:
         # The kanban goal-loop hook only runs in cli.py's fully-quiet branch.
         # Without -Q the worker gets one turn, prints text, exits rc=0, and the
