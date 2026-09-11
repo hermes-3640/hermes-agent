@@ -1522,6 +1522,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/slash", self._handle_session_slash),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("POST", "/api/sessions/{session_id}/stop", self._handle_stop_session),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -3273,6 +3274,47 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception as exc:
             logger.exception("[api_server] slash command failed: %s", exc)
             return web.json_response({"error": str(exc)}, status=500)
+
+    async def _handle_stop_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/stop — interrupt a running agent turn in a session."""
+        session_id = request.match_info["session_id"]
+        # Verify the session exists
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        # Find any in-flight run for this session by scanning _active_run_agents
+        # for agents whose session_id matches, and stop the first one found.
+        for run_id, run_agent in list(self._active_run_agents.items()):
+            if getattr(run_agent, "session_id", None) == session_id:
+                self._set_run_status(
+                    run_id, "stopping", session_id=session_id, last_event="run.stopping")
+                self._stopping_run_ids.add(run_id)
+                with suppress(Exception):
+                    request_hard_interrupt(run_agent, "Stop requested via /api/sessions/{id}/stop")
+                self._reap_disconnected_agent_processes(run_agent, source="api_server_session_stop")
+                return web.json_response({
+                    "object": "hermes.session",
+                    "session_id": session_id,
+                    "status": "stopping"})
+        # Also check _run_statuses for any non-terminal runs on this session
+        # (in case an agent finished but status wasn't fully cleaned up yet)
+        for run_id, status in list(self._run_statuses.items()):
+            if (status.get("session_id") == session_id
+                    and status.get("status") not in ("completed", "failed", "cancelled", "interrupted")):
+                self._set_run_status(run_id, "stopping", session_id=session_id, last_event="run.stopping")
+                self._stopping_run_ids.add(run_id)
+                agent = self._active_run_agents.get(run_id)
+                if agent is not None:
+                    with suppress(Exception):
+                        request_hard_interrupt(agent, "Stop requested via /api/sessions/{id}/stop")
+                    self._reap_disconnected_agent_processes(agent, source="api_server_session_stop")
+                return web.json_response({
+                    "object": "hermes.session",
+                    "session_id": session_id,
+                    "status": "stopping"})
+        return _error_response(
+            f"Session is not currently active: {session_id}", 409,
+            code="session_not_running")
 
     # -- Cron jobs API ----------------------------------------------------------------
 
